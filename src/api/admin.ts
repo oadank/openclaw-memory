@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { StorageOrchestrator } from "../storage/orchestrator.js";
 import type { CreateMemoryRequest, MigrateMarkdownRequest } from "../core/types.js";
+import { SyncQueueProcessor } from "../storage/sync-queue.js";
 
 // ── Admin Routes ────────────────────────────────────────────────────────
 
@@ -29,6 +30,72 @@ export function adminRoutes(orchestrator: StorageOrchestrator) {
         };
       }
     })
+
+    // POST /api/admin/resync — Requeue all memories for L2/L3 sync
+    .post(
+      "/api/admin/resync",
+      async ({ query, set }) => {
+        const layerParam = parseLayerParam(query.layer as string | undefined);
+        if (!layerParam) {
+          set.status = 400;
+          return {
+            error: "Invalid layer parameter",
+            details: "Use ?layer=qdrant|age|both",
+          };
+        }
+
+        const batch = parseBatchParam(query.batch as string | undefined);
+        if (batch === null) {
+          set.status = 400;
+          return {
+            error: "Invalid batch parameter",
+            details: "Use a positive integer for ?batch=50",
+          };
+        }
+
+        const layers: Array<"qdrant" | "age"> =
+          layerParam === "both" ? ["qdrant", "age"] : [layerParam];
+
+        try {
+          const memories = listAllMemories(orchestrator);
+          let queuedItems = 0;
+
+          for (const memory of memories) {
+            for (const layer of layers) {
+              orchestrator.sqlite.addToSyncQueue(memory.id, layer, "upsert");
+              queuedItems++;
+            }
+          }
+
+          const syncResults = await SyncQueueProcessor.withBatchSize(batch, async () => {
+            return await orchestrator.retrySyncQueue();
+          });
+
+          return {
+            layer: layerParam,
+            layers,
+            batch,
+            memory_count: memories.length,
+            queued_items: queuedItems,
+            sync_results: syncResults,
+          };
+        } catch (error) {
+          set.status = 500;
+          return {
+            error: "Resync failed",
+            details: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
+      {
+        query: t.Object({
+          layer: t.Optional(
+            t.Union([t.Literal("qdrant"), t.Literal("age"), t.Literal("both")])
+          ),
+          batch: t.Optional(t.String()),
+        }),
+      }
+    )
 
     // GET /api/sync/queue — View pending sync queue
     .get("/api/sync/queue", () => {
@@ -65,6 +132,41 @@ export function adminRoutes(orchestrator: StorageOrchestrator) {
       set.status = 501;
       return { error: "Not yet implemented" };
     });
+}
+
+type ResyncLayer = "qdrant" | "age" | "both";
+
+function parseLayerParam(layer: string | undefined): ResyncLayer | null {
+  if (!layer) return "both";
+  if (layer === "qdrant" || layer === "age" || layer === "both") return layer;
+  return null;
+}
+
+function parseBatchParam(batch: string | undefined): number | null {
+  if (!batch) return 50;
+  const parsed = Number.parseInt(batch, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function listAllMemories(orchestrator: StorageOrchestrator) {
+  const pageSize = 5_000;
+  const memories: ReturnType<typeof orchestrator.sqlite.listMemories> = [];
+  let offset = 0;
+
+  while (true) {
+    const page = orchestrator.sqlite.listMemories({
+      limit: pageSize,
+      offset,
+      order: "asc",
+    });
+
+    memories.push(...page);
+    if (page.length < pageSize) break;
+    offset += pageSize;
+  }
+
+  return memories;
 }
 
 // ── Markdown Migration ──────────────────────────────────────────────────

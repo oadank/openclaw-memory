@@ -6,6 +6,7 @@ import { normalizeFtsScore, applyBoosts } from "./ranker.js";
 // ── Search Engine ───────────────────────────────────────────────────────
 
 export class SearchEngine {
+  private static readonly LAYER_TIMEOUT_MS = 5_000;
   private orchestrator: StorageOrchestrator;
 
   constructor(orchestrator: StorageOrchestrator) {
@@ -29,38 +30,43 @@ export class SearchEngine {
 
     if (shouldSearchFulltext(strategy)) {
       searches.push(
-        this.searchFulltext(request, scopes, limit).then((results) => {
-          layerStats.sqlite.count = results.length;
-          allResults.push(...results);
-        })
+        this.collectLayerResults("sqlite", () => this.searchFulltext(request, scopes, limit), layerStats, allResults)
       );
     }
 
     if (shouldSearchSemantic(strategy) && this.orchestrator.qdrant && this.orchestrator.embeddings) {
       searches.push(
-        this.searchSemantic(request, scopes, limit).then((results) => {
-          layerStats.qdrant.count = results.length;
-          allResults.push(...results);
-        })
+        this.collectLayerResults(
+          "qdrant",
+          () =>
+            this.withLayerTimeout(
+              "qdrant",
+              () => this.searchSemantic(request, scopes, limit),
+              SearchEngine.LAYER_TIMEOUT_MS
+            ),
+          layerStats,
+          allResults
+        )
       );
     }
 
     if (shouldSearchGraph(strategy) && includeGraph && this.orchestrator.age) {
       searches.push(
-        this.searchGraph(request, limit).then((results) => {
-          layerStats.age.count = results.length;
-          allResults.push(...results);
-        })
+        this.collectLayerResults(
+          "age",
+          () =>
+            this.withLayerTimeout(
+              "age",
+              () => this.searchGraph(request, limit),
+              SearchEngine.LAYER_TIMEOUT_MS
+            ),
+          layerStats,
+          allResults
+        )
       );
     }
 
-    const startTime = Date.now();
     await Promise.allSettled(searches);
-    const elapsed = Date.now() - startTime;
-
-    if (layerStats.sqlite.count > 0) layerStats.sqlite.ms = elapsed;
-    if (layerStats.qdrant.count > 0) layerStats.qdrant.ms = elapsed;
-    if (layerStats.age.count > 0) layerStats.age.ms = elapsed;
 
     const merged = this.mergeResults(allResults, limit);
 
@@ -142,6 +148,57 @@ export class SearchEngine {
     } catch (error) {
       console.warn(`[search] Graph search failed: ${error}`);
       return [];
+    }
+  }
+
+  private async collectLayerResults(
+    layer: "sqlite" | "qdrant" | "age",
+    fn: () => Promise<ScoredMemory[]>,
+    layerStats: SearchResponse["layer_stats"],
+    allResults: ScoredMemory[]
+  ): Promise<void> {
+    const startedAt = Date.now();
+    try {
+      const results = await fn();
+      layerStats[layer].count = results.length;
+      allResults.push(...results);
+    } finally {
+      layerStats[layer].ms = Date.now() - startedAt;
+    }
+  }
+
+  private async withLayerTimeout(
+    layer: "qdrant" | "age",
+    fn: () => Promise<ScoredMemory[]>,
+    timeoutMs: number
+  ): Promise<ScoredMemory[]> {
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+
+    const layerPromise = fn().catch((error) => {
+      console.warn(`[search] ${layer} search failed: ${error}`);
+      return [];
+    });
+
+    const timeoutPromise = new Promise<ScoredMemory[]>((resolve) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        console.warn(
+          `[search] ${layer} search timed out after ${timeoutMs}ms, returning results from other layers`
+        );
+        resolve([]);
+      }, timeoutMs);
+    });
+
+    try {
+      const results = await Promise.race([layerPromise, timeoutPromise]);
+      return results;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (timedOut) {
+        // Keep the original promise observed so late rejections do not become unhandled.
+        void layerPromise;
+      }
     }
   }
 
