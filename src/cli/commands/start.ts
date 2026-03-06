@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import fs from "node:fs";
 import { spawn } from "node:child_process";
+import { createServer as createHttpServer } from "node:http";
 import { header, success, info, error as logError } from "../utils.js";
 import { getPidFilePath, getDataDir } from "../../config/index.js";
 
@@ -31,8 +32,24 @@ async function startForeground(opts: { port?: string; config?: string }): Promis
   const { app, config } = await createServer(opts.config);
 
   const port = opts.port ? parseInt(opts.port, 10) : config.port;
-  app.listen(port);
 
+  // Use native Node.js HTTP server for Elysia compatibility
+  const httpServer = createHttpServer(async (req, res) => {
+    const request = new Request(`http://${req.headers.host}${req.url}`, {
+      method: req.method,
+      headers: req.headers as Record<string, string>,
+    });
+    const response = await app.fetch(request);
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    if (response.body) {
+      for await (const chunk of response.body) {
+        res.write(chunk);
+      }
+    }
+    res.end();
+  });
+
+  httpServer.listen(port, "0.0.0.0");
   console.log(`[server] Listening on http://0.0.0.0:${port}`);
 
   // Write PID file for status/stop commands

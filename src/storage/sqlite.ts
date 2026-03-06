@@ -442,8 +442,8 @@ export class SqliteStorage {
       `SELECT * FROM sync_queue
        WHERE attempts < 5
        ORDER BY created_at ASC
-       LIMIT $limit`
-    ).all({ $limit: limit }) as SyncQueueRow[];
+       LIMIT :limit`
+    ).all({ limit: limit }) as SyncQueueRow[];
     return rows.map((r) => ({
       id: r.id,
       memory_id: r.memory_id,

@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { createServer as createHttpServer } from "node:http";
 import { loadConfig, configSummary } from "./config/index.js";
 import { StorageOrchestrator } from "./storage/orchestrator.js";
 import { createApp } from "./api/router.js";
@@ -29,7 +30,23 @@ async function main() {
   console.log("[config]");
   console.log(configSummary(config).split("\n").map((l) => `  ${l}`).join("\n"));
 
-  app.listen(config.port);
+  // Use native Node.js HTTP server for Elysia compatibility
+  const httpServer = createHttpServer(async (req, res) => {
+    const request = new Request(`http://${req.headers.host}${req.url}`, {
+      method: req.method,
+      headers: req.headers as Record<string, string>,
+    });
+    const response = await app.fetch(request);
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    if (response.body) {
+      for await (const chunk of response.body) {
+        res.write(chunk);
+      }
+    }
+    res.end();
+  });
+
+  httpServer.listen(config.port, config.host);
   console.log(`[server] Listening on http://${config.host}:${config.port}`);
   console.log(`[server] Health check: http://localhost:${config.port}/api/health`);
 
